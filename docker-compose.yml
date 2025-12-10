@@ -1,0 +1,35 @@
+# Docker Compose for Auto-Build Framework
+# ========================================
+#
+# Services:
+#   - falkordb: Graph database for Graphiti memory integration
+#
+# Usage:
+#   docker-compose up -d falkordb      # Start FalkorDB
+#   docker-compose ps                  # Check status
+#   docker-compose logs falkordb       # View logs
+#   docker-compose down                # Stop services
+
+version: '3.8'
+
+services:
+  falkordb:
+    image: falkordb/falkordb:latest
+    container_name: auto-build-falkordb
+    ports:
+      - "${GRAPHITI_FALKORDB_PORT:-6379}:6379"
+    volumes:
+      - falkordb_data:/data
+    environment:
+      # FalkorDB configuration
+      - FALKORDB_ARGS=--appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  falkordb_data:
+    driver: local

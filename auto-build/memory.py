@@ -6,6 +6,11 @@ Session Memory System
 Persists learnings between autonomous coding sessions to avoid rediscovering
 codebase patterns, gotchas, and insights.
 
+This module provides file-based memory as the primary storage mechanism.
+When Graphiti integration is enabled (GRAPHITI_ENABLED=true), insights are
+ALSO stored in the Graphiti knowledge graph for enhanced cross-session
+context retrieval.
+
 Each spec has its own memory directory:
     auto-build/specs/001-feature/memory/
         ├── codebase_map.json      # Key files and their purposes
@@ -46,13 +51,134 @@ Usage:
     # Append pattern
     from memory import append_pattern
     append_pattern(spec_dir, "Use try/except with specific exceptions, log errors with context")
+
+Graphiti Integration:
+    When GRAPHITI_ENABLED=true and OPENAI_API_KEY is set, session insights
+    and discoveries are also saved to the Graphiti knowledge graph.
+    This enables semantic search and cross-session context retrieval.
+
+    # Check if Graphiti is enabled
+    from memory import is_graphiti_memory_enabled
+    if is_graphiti_memory_enabled():
+        # Graphiti will automatically store data alongside file-based memory
+        pass
 """
 
+import asyncio
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
+# Configure logging
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Graphiti Integration Helpers
+# =============================================================================
+
+def is_graphiti_memory_enabled() -> bool:
+    """
+    Check if Graphiti memory integration is available.
+
+    Returns True if:
+    - GRAPHITI_ENABLED is set to true/1/yes
+    - OPENAI_API_KEY is set (required for embeddings)
+    """
+    try:
+        from graphiti_config import is_graphiti_enabled
+        return is_graphiti_enabled()
+    except ImportError:
+        return False
+
+
+def _get_graphiti_memory(spec_dir: Path, project_dir: Optional[Path] = None):
+    """
+    Get a GraphitiMemory instance if available.
+
+    Args:
+        spec_dir: Spec directory
+        project_dir: Project root directory (defaults to spec_dir.parent.parent)
+
+    Returns:
+        GraphitiMemory instance or None if not available
+    """
+    if not is_graphiti_memory_enabled():
+        return None
+
+    try:
+        from graphiti_memory import GraphitiMemory
+        if project_dir is None:
+            project_dir = spec_dir.parent.parent
+        return GraphitiMemory(spec_dir, project_dir)
+    except ImportError:
+        return None
+
+
+def _run_async(coro):
+    """
+    Run an async coroutine synchronously.
+
+    Handles the case where we're already in an event loop.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        # Already in an event loop - create a task
+        return asyncio.ensure_future(coro)
+    except RuntimeError:
+        # No event loop running - create one
+        return asyncio.run(coro)
+
+
+async def _save_to_graphiti_async(
+    spec_dir: Path,
+    session_num: int,
+    insights: dict,
+    project_dir: Optional[Path] = None,
+) -> bool:
+    """
+    Save session insights to Graphiti (async helper).
+
+    This is called in addition to file-based storage when Graphiti is enabled.
+    """
+    graphiti = _get_graphiti_memory(spec_dir, project_dir)
+    if not graphiti:
+        return False
+
+    try:
+        result = await graphiti.save_session_insights(session_num, insights)
+
+        # Also save codebase discoveries if present
+        discoveries = insights.get("discoveries", {})
+        files_understood = discoveries.get("files_understood", {})
+        if files_understood:
+            await graphiti.save_codebase_discoveries(files_understood)
+
+        # Save patterns
+        for pattern in discoveries.get("patterns_found", []):
+            await graphiti.save_pattern(pattern)
+
+        # Save gotchas
+        for gotcha in discoveries.get("gotchas_encountered", []):
+            await graphiti.save_gotcha(gotcha)
+
+        await graphiti.close()
+        return result
+
+    except Exception as e:
+        logger.warning(f"Failed to save to Graphiti: {e}")
+        try:
+            await graphiti.close()
+        except Exception:
+            pass
+        return False
+
+
+# =============================================================================
+# File-Based Memory Functions
+# =============================================================================
 
 def get_memory_dir(spec_dir: Path) -> Path:
     """
@@ -134,9 +260,18 @@ def save_session_insights(spec_dir: Path, session_num: int, insights: dict) -> N
         "recommendations_for_next_session": insights.get("recommendations_for_next_session", []),
     }
 
-    # Write to file
+    # Write to file (always use file-based storage)
     with open(session_file, "w") as f:
         json.dump(session_data, f, indent=2)
+
+    # Also save to Graphiti if enabled (non-blocking, errors logged but not raised)
+    if is_graphiti_memory_enabled():
+        try:
+            _run_async(_save_to_graphiti_async(spec_dir, session_num, session_data))
+            logger.info(f"Session {session_num} insights also saved to Graphiti")
+        except Exception as e:
+            # Don't fail the save if Graphiti fails - file-based is the primary storage
+            logger.warning(f"Graphiti save failed (file-based save succeeded): {e}")
 
 
 def load_all_insights(spec_dir: Path) -> list[dict]:
@@ -211,6 +346,16 @@ def update_codebase_map(spec_dir: Path, discoveries: dict[str, str]) -> None:
     with open(map_file, "w") as f:
         json.dump(codebase_map, f, indent=2, sort_keys=True)
 
+    # Also save to Graphiti if enabled
+    if is_graphiti_memory_enabled() and discoveries:
+        try:
+            graphiti = _get_graphiti_memory(spec_dir)
+            if graphiti:
+                _run_async(graphiti.save_codebase_discoveries(discoveries))
+                logger.info(f"Codebase discoveries also saved to Graphiti")
+        except Exception as e:
+            logger.warning(f"Graphiti codebase save failed: {e}")
+
 
 def load_codebase_map(spec_dir: Path) -> dict[str, str]:
     """
@@ -280,6 +425,15 @@ def append_gotcha(spec_dir: Path, gotcha: str) -> None:
                 f.write("Things to watch out for in this codebase:\n\n")
             f.write(f"- {gotcha_stripped}\n")
 
+        # Also save to Graphiti if enabled
+        if is_graphiti_memory_enabled():
+            try:
+                graphiti = _get_graphiti_memory(spec_dir)
+                if graphiti:
+                    _run_async(graphiti.save_gotcha(gotcha_stripped))
+            except Exception as e:
+                logger.warning(f"Graphiti gotcha save failed: {e}")
+
 
 def load_gotchas(spec_dir: Path) -> list[str]:
     """
@@ -346,6 +500,15 @@ def append_pattern(spec_dir: Path, pattern: str) -> None:
                 f.write("# Code Patterns\n\n")
                 f.write("Established patterns to follow in this codebase:\n\n")
             f.write(f"- {pattern_stripped}\n")
+
+        # Also save to Graphiti if enabled
+        if is_graphiti_memory_enabled():
+            try:
+                graphiti = _get_graphiti_memory(spec_dir)
+                if graphiti:
+                    _run_async(graphiti.save_pattern(pattern_stripped))
+            except Exception as e:
+                logger.warning(f"Graphiti pattern save failed: {e}")
 
 
 def load_patterns(spec_dir: Path) -> list[str]:

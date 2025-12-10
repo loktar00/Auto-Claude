@@ -52,6 +52,7 @@ from agent import run_autonomous_agent
 from coordinator import SwarmCoordinator
 from progress import count_chunks, print_paused_banner
 from linear_integration import is_linear_enabled, LinearManager
+from graphiti_config import is_graphiti_enabled, get_graphiti_status
 from ui import (
     Icons,
     icon,
@@ -430,6 +431,17 @@ def validate_environment(spec_dir: Path) -> bool:
             print("  Status: Will be initialized during planner session")
     else:
         print("Linear integration: DISABLED (set LINEAR_API_KEY to enable)")
+
+    # Check Graphiti integration (optional but show status)
+    graphiti_status = get_graphiti_status()
+    if graphiti_status["available"]:
+        print("Graphiti memory: ENABLED")
+        print(f"  Database: {graphiti_status['database']}")
+        print(f"  Host: {graphiti_status['host']}:{graphiti_status['port']}")
+    elif graphiti_status["enabled"]:
+        print(f"Graphiti memory: CONFIGURED but unavailable ({graphiti_status['reason']})")
+    else:
+        print("Graphiti memory: DISABLED (set GRAPHITI_ENABLED=true to enable)")
 
     print()
     return valid
