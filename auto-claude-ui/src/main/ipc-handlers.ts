@@ -68,7 +68,8 @@ import {
 } from './auto-claude-updater';
 import { changelogService } from './changelog-service';
 import { insightsService } from './insights-service';
-import type { AutoBuildSourceUpdateProgress, InsightsSession, InsightsChatStatus, InsightsStreamChunk } from '../shared/types';
+import { taskLogService } from './task-log-service';
+import type { AutoBuildSourceUpdateProgress, InsightsSession, InsightsChatStatus, InsightsStreamChunk, TaskLogs, TaskLogStreamChunk } from '../shared/types';
 
 /**
  * Setup all IPC handlers
@@ -1736,6 +1737,108 @@ export function setupIpcHandlers(
       }
     }
   );
+
+  // ============================================
+  // Task Phase Logs (collapsible by phase)
+  // ============================================
+
+  /**
+   * Get task logs from spec directory
+   * Returns logs organized by phase (planning, coding, validation)
+   */
+  ipcMain.handle(
+    IPC_CHANNELS.TASK_LOGS_GET,
+    async (_, projectId: string, specId: string): Promise<IPCResult<TaskLogs | null>> => {
+      try {
+        const project = projectStore.getProject(projectId);
+        if (!project) {
+          return { success: false, error: 'Project not found' };
+        }
+
+        const specsDir = getSpecsDir(project.path, project.settings.devMode);
+        const specDir = path.join(specsDir, specId);
+
+        if (!existsSync(specDir)) {
+          return { success: false, error: 'Spec directory not found' };
+        }
+
+        const logs = taskLogService.loadLogs(specDir);
+        return { success: true, data: logs };
+      } catch (error) {
+        console.error('Failed to get task logs:', error);
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : 'Failed to get task logs'
+        };
+      }
+    }
+  );
+
+  /**
+   * Start watching a spec for log changes
+   * Emits TASK_LOGS_CHANGED and TASK_LOGS_STREAM events
+   */
+  ipcMain.handle(
+    IPC_CHANNELS.TASK_LOGS_WATCH,
+    async (_, projectId: string, specId: string): Promise<IPCResult> => {
+      try {
+        const project = projectStore.getProject(projectId);
+        if (!project) {
+          return { success: false, error: 'Project not found' };
+        }
+
+        const specsDir = getSpecsDir(project.path, project.settings.devMode);
+        const specDir = path.join(specsDir, specId);
+
+        if (!existsSync(specDir)) {
+          return { success: false, error: 'Spec directory not found' };
+        }
+
+        taskLogService.startWatching(specId, specDir);
+        return { success: true };
+      } catch (error) {
+        console.error('Failed to start watching task logs:', error);
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : 'Failed to start watching'
+        };
+      }
+    }
+  );
+
+  /**
+   * Stop watching a spec for log changes
+   */
+  ipcMain.handle(
+    IPC_CHANNELS.TASK_LOGS_UNWATCH,
+    async (_, specId: string): Promise<IPCResult> => {
+      try {
+        taskLogService.stopWatching(specId);
+        return { success: true };
+      } catch (error) {
+        console.error('Failed to stop watching task logs:', error);
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : 'Failed to stop watching'
+        };
+      }
+    }
+  );
+
+  // Setup task log service event forwarding to renderer
+  taskLogService.on('logs-changed', (specId: string, logs: TaskLogs) => {
+    const mainWindow = getMainWindow();
+    if (mainWindow) {
+      mainWindow.webContents.send(IPC_CHANNELS.TASK_LOGS_CHANGED, specId, logs);
+    }
+  });
+
+  taskLogService.on('stream-chunk', (specId: string, chunk: TaskLogStreamChunk) => {
+    const mainWindow = getMainWindow();
+    if (mainWindow) {
+      mainWindow.webContents.send(IPC_CHANNELS.TASK_LOGS_STREAM, specId, chunk);
+    }
+  });
 
   // ============================================
   // Settings Operations

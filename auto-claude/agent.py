@@ -68,6 +68,13 @@ from ui import (
     StatusManager,
     BuildState,
 )
+from task_logger import (
+    TaskLogger,
+    LogPhase,
+    LogEntryType,
+    get_task_logger,
+    clear_task_logger,
+)
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -463,6 +470,7 @@ async def run_agent_session(
     message: str,
     spec_dir: Path,
     verbose: bool = False,
+    phase: LogPhase = LogPhase.CODING,
 ) -> tuple[str, str]:
     """
     Run a single agent session using Claude Agent SDK.
@@ -472,6 +480,7 @@ async def run_agent_session(
         message: The prompt to send
         spec_dir: Spec directory path
         verbose: Whether to show detailed output
+        phase: Current execution phase for logging
 
     Returns:
         (status, response_text) where status is:
@@ -480,6 +489,10 @@ async def run_agent_session(
         - "error" if an error occurred
     """
     print("Sending prompt to Claude Agent SDK...\n")
+
+    # Get task logger for this spec
+    task_logger = get_task_logger(spec_dir)
+    current_tool = None
 
     try:
         # Send the query
@@ -498,14 +511,48 @@ async def run_agent_session(
                     if block_type == "TextBlock" and hasattr(block, "text"):
                         response_text += block.text
                         print(block.text, end="", flush=True)
+                        # Log text to task logger (emit streaming marker)
+                        if task_logger and block.text.strip():
+                            task_logger._emit("TEXT", {
+                                "content": block.text,
+                                "phase": phase.value,
+                                "timestamp": task_logger._timestamp()
+                            })
                     elif block_type == "ToolUseBlock" and hasattr(block, "name"):
-                        print(f"\n[Tool: {block.name}]", flush=True)
+                        tool_name = block.name
+                        tool_input = None
+
+                        # Extract meaningful tool input for display
+                        if hasattr(block, "input") and block.input:
+                            inp = block.input
+                            if isinstance(inp, dict):
+                                if "pattern" in inp:
+                                    tool_input = f"pattern: {inp['pattern']}"
+                                elif "file_path" in inp:
+                                    fp = inp["file_path"]
+                                    if len(fp) > 50:
+                                        fp = "..." + fp[-47:]
+                                    tool_input = fp
+                                elif "command" in inp:
+                                    cmd = inp["command"]
+                                    if len(cmd) > 50:
+                                        cmd = cmd[:47] + "..."
+                                    tool_input = cmd
+                                elif "path" in inp:
+                                    tool_input = inp["path"]
+
+                        print(f"\n[Tool: {tool_name}]", flush=True)
                         if verbose and hasattr(block, "input"):
                             input_str = str(block.input)
                             if len(input_str) > 300:
                                 print(f"   Input: {input_str[:300]}...", flush=True)
                             else:
                                 print(f"   Input: {input_str}", flush=True)
+
+                        # Log tool start
+                        if task_logger:
+                            task_logger.tool_start(tool_name, tool_input, phase)
+                        current_tool = tool_name
 
             # Handle UserMessage (tool results)
             elif msg_type == "UserMessage" and hasattr(msg, "content"):
@@ -519,10 +566,14 @@ async def run_agent_session(
                         # Check if command was blocked by security hook
                         if "blocked" in str(result_content).lower():
                             print(f"   [BLOCKED] {result_content}", flush=True)
+                            if task_logger and current_tool:
+                                task_logger.tool_end(current_tool, success=False, result="BLOCKED", phase=phase)
                         elif is_error:
                             # Show errors (truncated)
                             error_str = str(result_content)[:500]
                             print(f"   [Error] {error_str}", flush=True)
+                            if task_logger and current_tool:
+                                task_logger.tool_end(current_tool, success=False, result=error_str[:100], phase=phase)
                         else:
                             # Tool succeeded
                             if verbose:
@@ -530,6 +581,10 @@ async def run_agent_session(
                                 print(f"   [Done] {result_str}", flush=True)
                             else:
                                 print("   [Done]", flush=True)
+                            if task_logger and current_tool:
+                                task_logger.tool_end(current_tool, success=True, phase=phase)
+
+                        current_tool = None
 
         print("\n" + "-" * 70 + "\n")
 
@@ -541,6 +596,8 @@ async def run_agent_session(
 
     except Exception as e:
         print(f"Error during agent session: {e}")
+        if task_logger:
+            task_logger.log_error(f"Session error: {e}", phase)
         return "error", str(e)
 
 
@@ -568,6 +625,9 @@ async def run_autonomous_agent(
     status_manager = StatusManager(project_dir)
     status_manager.set_active(spec_dir.name, BuildState.BUILDING)
 
+    # Initialize task logger for persistent logging
+    task_logger = get_task_logger(spec_dir)
+
     # Update initial chunk counts
     chunks = count_chunks_detailed(spec_dir)
     status_manager.update_chunks(
@@ -592,6 +652,10 @@ async def run_autonomous_agent(
     # Check if this is a fresh start or continuation
     first_run = is_first_run(spec_dir)
 
+    # Track which phase we're in for logging
+    current_log_phase = LogPhase.CODING
+    is_planning_phase = False
+
     if first_run:
         print_status("Fresh start - will use Planner Agent to create implementation plan", "info")
         content = [
@@ -606,6 +670,12 @@ async def run_autonomous_agent(
 
         # Update status for planning phase
         status_manager.update(state=BuildState.PLANNING)
+        is_planning_phase = True
+        current_log_phase = LogPhase.PLANNING
+
+        # Start planning phase in task logger
+        if task_logger:
+            task_logger.start_phase(LogPhase.PLANNING, "Starting implementation planning...")
 
         # Update Linear to "In Progress" when build starts
         if linear_task and linear_task.task_id:
@@ -620,6 +690,10 @@ async def run_autonomous_agent(
             print_build_complete_banner(spec_dir)
             status_manager.update(state=BuildState.COMPLETE)
             return
+
+        # Start/continue coding phase in task logger
+        if task_logger:
+            task_logger.start_phase(LogPhase.CODING, "Continuing implementation...")
 
     # Show human intervention hint
     content = [
@@ -698,7 +772,19 @@ async def run_autonomous_agent(
         if first_run:
             prompt = generate_planner_prompt(spec_dir, project_dir)
             first_run = False
+            current_log_phase = LogPhase.PLANNING
+
+            # Set session info in logger
+            if task_logger:
+                task_logger.set_session(iteration)
         else:
+            # Switch to coding phase after planning
+            if is_planning_phase:
+                is_planning_phase = False
+                current_log_phase = LogPhase.CODING
+                if task_logger:
+                    task_logger.end_phase(LogPhase.PLANNING, success=True, message="Implementation plan created")
+                    task_logger.start_phase(LogPhase.CODING, "Starting implementation...")
             if not next_chunk:
                 print("No pending chunks found - build may be complete!")
                 break
@@ -739,10 +825,15 @@ async def run_autonomous_agent(
                 print_status(f"Previous attempts: {attempt_count}", "warning")
             print()
 
+        # Set chunk info in logger
+        if task_logger and chunk_id:
+            task_logger.set_chunk(chunk_id)
+            task_logger.set_session(iteration)
+
         # Run session with async context manager
         async with client:
             status, response = await run_agent_session(
-                client, prompt, spec_dir, verbose
+                client, prompt, spec_dir, verbose, phase=current_log_phase
             )
 
         # === POST-SESSION PROCESSING (100% reliable) ===
@@ -784,6 +875,10 @@ async def run_autonomous_agent(
         if status == "complete":
             print_build_complete_banner(spec_dir)
             status_manager.update(state=BuildState.COMPLETE)
+
+            # End coding phase in task logger
+            if task_logger:
+                task_logger.end_phase(LogPhase.CODING, success=True, message="All chunks completed successfully")
 
             # Notify Linear that build is complete (moving to QA)
             if linear_task and linear_task.task_id:

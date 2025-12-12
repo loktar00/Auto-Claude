@@ -1,0 +1,593 @@
+"""
+Task Logger
+============
+
+Persistent logging system for Auto Claude tasks.
+Logs are organized by phase (planning, coding, validation) and stored in the spec directory.
+
+Key features:
+- Phase-based log organization (collapsible in UI)
+- Streaming markers for real-time UI updates (similar to insights_runner.py)
+- Persistent storage in JSON format for easy frontend consumption
+- Tool usage tracking with start/end markers
+"""
+
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional, Literal
+from dataclasses import dataclass, asdict
+from enum import Enum
+
+
+class LogPhase(str, Enum):
+    """Log phases matching the execution flow."""
+    PLANNING = "planning"
+    CODING = "coding"
+    VALIDATION = "validation"
+
+
+class LogEntryType(str, Enum):
+    """Types of log entries."""
+    TEXT = "text"
+    TOOL_START = "tool_start"
+    TOOL_END = "tool_end"
+    PHASE_START = "phase_start"
+    PHASE_END = "phase_end"
+    ERROR = "error"
+    SUCCESS = "success"
+    INFO = "info"
+
+
+@dataclass
+class LogEntry:
+    """A single log entry."""
+    timestamp: str
+    type: str
+    content: str
+    phase: str
+    tool_name: Optional[str] = None
+    tool_input: Optional[str] = None
+    chunk_id: Optional[str] = None
+    session: Optional[int] = None
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary, excluding None values."""
+        return {k: v for k, v in asdict(self).items() if v is not None}
+
+
+@dataclass
+class PhaseLog:
+    """Logs for a single phase."""
+    phase: str
+    status: str  # "pending", "active", "completed", "failed"
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    entries: list = None
+
+    def __post_init__(self):
+        if self.entries is None:
+            self.entries = []
+
+    def to_dict(self) -> dict:
+        return {
+            "phase": self.phase,
+            "status": self.status,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "entries": self.entries
+        }
+
+
+class TaskLogger:
+    """
+    Logger for a specific task/spec.
+
+    Handles persistent storage of logs and emits streaming markers
+    for real-time UI updates.
+
+    Usage:
+        logger = TaskLogger(spec_dir)
+        logger.start_phase(LogPhase.CODING)
+        logger.log("Starting implementation...")
+        logger.tool_start("Read", "/path/to/file.py")
+        logger.tool_end("Read")
+        logger.log("File read complete")
+        logger.end_phase(LogPhase.CODING, success=True)
+    """
+
+    LOG_FILE = "task_logs.json"
+
+    def __init__(self, spec_dir: Path, emit_markers: bool = True):
+        """
+        Initialize the task logger.
+
+        Args:
+            spec_dir: Path to the spec directory
+            emit_markers: Whether to emit streaming markers to stdout
+        """
+        self.spec_dir = Path(spec_dir)
+        self.log_file = self.spec_dir / self.LOG_FILE
+        self.emit_markers = emit_markers
+        self.current_phase: Optional[LogPhase] = None
+        self.current_session: Optional[int] = None
+        self.current_chunk: Optional[str] = None
+        self._data: dict = self._load_or_create()
+
+    def _load_or_create(self) -> dict:
+        """Load existing logs or create new structure."""
+        if self.log_file.exists():
+            try:
+                with open(self.log_file) as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError):
+                pass
+
+        return {
+            "spec_id": self.spec_dir.name,
+            "created_at": self._timestamp(),
+            "updated_at": self._timestamp(),
+            "phases": {
+                LogPhase.PLANNING.value: {
+                    "phase": LogPhase.PLANNING.value,
+                    "status": "pending",
+                    "started_at": None,
+                    "completed_at": None,
+                    "entries": []
+                },
+                LogPhase.CODING.value: {
+                    "phase": LogPhase.CODING.value,
+                    "status": "pending",
+                    "started_at": None,
+                    "completed_at": None,
+                    "entries": []
+                },
+                LogPhase.VALIDATION.value: {
+                    "phase": LogPhase.VALIDATION.value,
+                    "status": "pending",
+                    "started_at": None,
+                    "completed_at": None,
+                    "entries": []
+                }
+            }
+        }
+
+    def _save(self):
+        """Save logs to file."""
+        self._data["updated_at"] = self._timestamp()
+        try:
+            self.spec_dir.mkdir(parents=True, exist_ok=True)
+            with open(self.log_file, "w") as f:
+                json.dump(self._data, f, indent=2)
+        except IOError as e:
+            print(f"Warning: Failed to save task logs: {e}", file=sys.stderr)
+
+    def _timestamp(self) -> str:
+        """Get current timestamp in ISO format."""
+        return datetime.now(timezone.utc).isoformat()
+
+    def _emit(self, marker_type: str, data: dict):
+        """Emit a streaming marker to stdout for UI consumption."""
+        if not self.emit_markers:
+            return
+        try:
+            marker = f"__TASK_LOG_{marker_type.upper()}__:{json.dumps(data)}"
+            print(marker, flush=True)
+        except Exception:
+            pass  # Don't let marker emission break logging
+
+    def _add_entry(self, entry: LogEntry):
+        """Add an entry to the current phase."""
+        phase_key = entry.phase
+        if phase_key not in self._data["phases"]:
+            # Create phase if it doesn't exist
+            self._data["phases"][phase_key] = {
+                "phase": phase_key,
+                "status": "active",
+                "started_at": self._timestamp(),
+                "completed_at": None,
+                "entries": []
+            }
+
+        self._data["phases"][phase_key]["entries"].append(entry.to_dict())
+        self._save()
+
+    def set_session(self, session: int):
+        """Set the current session number."""
+        self.current_session = session
+
+    def set_chunk(self, chunk_id: Optional[str]):
+        """Set the current chunk being processed."""
+        self.current_chunk = chunk_id
+
+    def start_phase(self, phase: LogPhase, message: Optional[str] = None):
+        """
+        Start a new phase.
+
+        Args:
+            phase: The phase to start
+            message: Optional message to log at phase start
+        """
+        self.current_phase = phase
+        phase_key = phase.value
+
+        # Update phase status
+        if phase_key in self._data["phases"]:
+            self._data["phases"][phase_key]["status"] = "active"
+            self._data["phases"][phase_key]["started_at"] = self._timestamp()
+
+        # Emit marker for UI
+        self._emit("PHASE_START", {
+            "phase": phase_key,
+            "timestamp": self._timestamp()
+        })
+
+        # Add phase start entry
+        entry = LogEntry(
+            timestamp=self._timestamp(),
+            type=LogEntryType.PHASE_START.value,
+            content=message or f"Starting {phase_key} phase",
+            phase=phase_key,
+            session=self.current_session
+        )
+        self._add_entry(entry)
+
+        # Also print the message
+        if message:
+            print(message, flush=True)
+
+    def end_phase(self, phase: LogPhase, success: bool = True, message: Optional[str] = None):
+        """
+        End a phase.
+
+        Args:
+            phase: The phase to end
+            success: Whether the phase completed successfully
+            message: Optional message to log at phase end
+        """
+        phase_key = phase.value
+
+        # Update phase status
+        if phase_key in self._data["phases"]:
+            self._data["phases"][phase_key]["status"] = "completed" if success else "failed"
+            self._data["phases"][phase_key]["completed_at"] = self._timestamp()
+
+        # Emit marker for UI
+        self._emit("PHASE_END", {
+            "phase": phase_key,
+            "success": success,
+            "timestamp": self._timestamp()
+        })
+
+        # Add phase end entry
+        entry = LogEntry(
+            timestamp=self._timestamp(),
+            type=LogEntryType.PHASE_END.value,
+            content=message or f"{'Completed' if success else 'Failed'} {phase_key} phase",
+            phase=phase_key,
+            session=self.current_session
+        )
+        self._add_entry(entry)
+
+        if message:
+            print(message, flush=True)
+
+        if phase == self.current_phase:
+            self.current_phase = None
+
+        self._save()
+
+    def log(self, content: str, entry_type: LogEntryType = LogEntryType.TEXT, phase: Optional[LogPhase] = None):
+        """
+        Log a message.
+
+        Args:
+            content: The message to log
+            entry_type: Type of entry (text, error, success, info)
+            phase: Optional phase override (uses current_phase if not specified)
+        """
+        phase_key = (phase or self.current_phase or LogPhase.CODING).value
+
+        entry = LogEntry(
+            timestamp=self._timestamp(),
+            type=entry_type.value,
+            content=content,
+            phase=phase_key,
+            chunk_id=self.current_chunk,
+            session=self.current_session
+        )
+        self._add_entry(entry)
+
+        # Emit streaming marker
+        self._emit("TEXT", {
+            "content": content,
+            "phase": phase_key,
+            "type": entry_type.value,
+            "chunk_id": self.current_chunk,
+            "timestamp": self._timestamp()
+        })
+
+        # Also print to console
+        print(content, flush=True)
+
+    def log_error(self, content: str, phase: Optional[LogPhase] = None):
+        """Log an error message."""
+        self.log(content, LogEntryType.ERROR, phase)
+
+    def log_success(self, content: str, phase: Optional[LogPhase] = None):
+        """Log a success message."""
+        self.log(content, LogEntryType.SUCCESS, phase)
+
+    def log_info(self, content: str, phase: Optional[LogPhase] = None):
+        """Log an info message."""
+        self.log(content, LogEntryType.INFO, phase)
+
+    def tool_start(self, tool_name: str, tool_input: Optional[str] = None, phase: Optional[LogPhase] = None):
+        """
+        Log the start of a tool execution.
+
+        Args:
+            tool_name: Name of the tool (e.g., "Read", "Write", "Bash")
+            tool_input: Brief description of tool input
+            phase: Optional phase override
+        """
+        phase_key = (phase or self.current_phase or LogPhase.CODING).value
+
+        # Truncate long inputs for display
+        display_input = tool_input
+        if display_input and len(display_input) > 100:
+            display_input = display_input[:97] + "..."
+
+        entry = LogEntry(
+            timestamp=self._timestamp(),
+            type=LogEntryType.TOOL_START.value,
+            content=f"[{tool_name}] {display_input or ''}".strip(),
+            phase=phase_key,
+            tool_name=tool_name,
+            tool_input=display_input,
+            chunk_id=self.current_chunk,
+            session=self.current_session
+        )
+        self._add_entry(entry)
+
+        # Emit streaming marker (same format as insights_runner.py)
+        self._emit("TOOL_START", {
+            "name": tool_name,
+            "input": display_input,
+            "phase": phase_key
+        })
+
+        print(f"[Tool: {tool_name}]", flush=True)
+
+    def tool_end(self, tool_name: str, success: bool = True, result: Optional[str] = None, phase: Optional[LogPhase] = None):
+        """
+        Log the end of a tool execution.
+
+        Args:
+            tool_name: Name of the tool
+            success: Whether the tool succeeded
+            result: Optional brief result description
+            phase: Optional phase override
+        """
+        phase_key = (phase or self.current_phase or LogPhase.CODING).value
+
+        # Truncate long results
+        display_result = result
+        if display_result and len(display_result) > 100:
+            display_result = display_result[:97] + "..."
+
+        status = "Done" if success else "Error"
+        content = f"[{tool_name}] {status}"
+        if display_result:
+            content += f": {display_result}"
+
+        entry = LogEntry(
+            timestamp=self._timestamp(),
+            type=LogEntryType.TOOL_END.value,
+            content=content,
+            phase=phase_key,
+            tool_name=tool_name,
+            chunk_id=self.current_chunk,
+            session=self.current_session
+        )
+        self._add_entry(entry)
+
+        # Emit streaming marker
+        self._emit("TOOL_END", {
+            "name": tool_name,
+            "success": success,
+            "phase": phase_key
+        })
+
+        if result:
+            print(f"   [{status}] {display_result}", flush=True)
+        else:
+            print(f"   [{status}]", flush=True)
+
+    def get_logs(self) -> dict:
+        """Get all logs."""
+        return self._data
+
+    def get_phase_logs(self, phase: LogPhase) -> dict:
+        """Get logs for a specific phase."""
+        return self._data["phases"].get(phase.value, {})
+
+    def clear(self):
+        """Clear all logs (useful for testing)."""
+        self._data = self._load_or_create()
+        self._save()
+
+
+def load_task_logs(spec_dir: Path) -> Optional[dict]:
+    """
+    Load task logs from a spec directory.
+
+    Args:
+        spec_dir: Path to the spec directory
+
+    Returns:
+        Logs dictionary or None if not found
+    """
+    log_file = spec_dir / TaskLogger.LOG_FILE
+    if not log_file.exists():
+        return None
+
+    try:
+        with open(log_file) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return None
+
+
+def get_active_phase(spec_dir: Path) -> Optional[str]:
+    """
+    Get the currently active phase for a spec.
+
+    Args:
+        spec_dir: Path to the spec directory
+
+    Returns:
+        Phase name or None if no active phase
+    """
+    logs = load_task_logs(spec_dir)
+    if not logs:
+        return None
+
+    for phase_name, phase_data in logs.get("phases", {}).items():
+        if phase_data.get("status") == "active":
+            return phase_name
+
+    return None
+
+
+# Global logger instance for easy access
+_current_logger: Optional[TaskLogger] = None
+
+
+def get_task_logger(spec_dir: Optional[Path] = None, emit_markers: bool = True) -> Optional[TaskLogger]:
+    """
+    Get or create a task logger for the given spec directory.
+
+    Args:
+        spec_dir: Path to the spec directory (creates new logger if different from current)
+        emit_markers: Whether to emit streaming markers
+
+    Returns:
+        TaskLogger instance or None if no spec_dir
+    """
+    global _current_logger
+
+    if spec_dir is None:
+        return _current_logger
+
+    if _current_logger is None or _current_logger.spec_dir != spec_dir:
+        _current_logger = TaskLogger(spec_dir, emit_markers)
+
+    return _current_logger
+
+
+def clear_task_logger():
+    """Clear the global task logger."""
+    global _current_logger
+    _current_logger = None
+
+
+class StreamingLogCapture:
+    """
+    Context manager to capture streaming output and log it.
+
+    Usage:
+        with StreamingLogCapture(logger, phase) as capture:
+            # Run agent session
+            async for msg in client.receive_response():
+                capture.process_message(msg)
+    """
+
+    def __init__(self, logger: TaskLogger, phase: Optional[LogPhase] = None):
+        self.logger = logger
+        self.phase = phase
+        self.current_tool: Optional[str] = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # End any active tool
+        if self.current_tool:
+            self.logger.tool_end(self.current_tool, success=exc_type is None, phase=self.phase)
+            self.current_tool = None
+        return False
+
+    def process_text(self, text: str):
+        """Process text output from the agent."""
+        if text.strip():
+            self.logger.log(text, phase=self.phase)
+
+    def process_tool_start(self, tool_name: str, tool_input: Optional[str] = None):
+        """Process tool start."""
+        # End previous tool if any
+        if self.current_tool:
+            self.logger.tool_end(self.current_tool, success=True, phase=self.phase)
+
+        self.current_tool = tool_name
+        self.logger.tool_start(tool_name, tool_input, phase=self.phase)
+
+    def process_tool_end(self, tool_name: str, success: bool = True, result: Optional[str] = None):
+        """Process tool end."""
+        self.logger.tool_end(tool_name, success, result, phase=self.phase)
+        if self.current_tool == tool_name:
+            self.current_tool = None
+
+    def process_message(self, msg, verbose: bool = False):
+        """
+        Process a message from the Claude SDK stream.
+
+        Args:
+            msg: Message from client.receive_response()
+            verbose: Whether to show detailed tool results
+        """
+        msg_type = type(msg).__name__
+
+        if msg_type == "AssistantMessage" and hasattr(msg, "content"):
+            for block in msg.content:
+                block_type = type(block).__name__
+
+                if block_type == "TextBlock" and hasattr(block, "text"):
+                    # Text is already logged by the agent session
+                    pass
+                elif block_type == "ToolUseBlock" and hasattr(block, "name"):
+                    tool_input = None
+                    if hasattr(block, "input") and block.input:
+                        inp = block.input
+                        if isinstance(inp, dict):
+                            # Extract meaningful input description
+                            if "pattern" in inp:
+                                tool_input = f"pattern: {inp['pattern']}"
+                            elif "file_path" in inp:
+                                fp = inp["file_path"]
+                                if len(fp) > 50:
+                                    fp = "..." + fp[-47:]
+                                tool_input = fp
+                            elif "command" in inp:
+                                cmd = inp["command"]
+                                if len(cmd) > 50:
+                                    cmd = cmd[:47] + "..."
+                                tool_input = cmd
+                            elif "path" in inp:
+                                tool_input = inp["path"]
+                    self.process_tool_start(block.name, tool_input)
+
+        elif msg_type == "UserMessage" and hasattr(msg, "content"):
+            for block in msg.content:
+                block_type = type(block).__name__
+
+                if block_type == "ToolResultBlock":
+                    is_error = getattr(block, "is_error", False)
+                    result_content = getattr(block, "content", "")
+
+                    if self.current_tool:
+                        result_str = None
+                        if verbose and result_content:
+                            result_str = str(result_content)[:100]
+                        self.process_tool_end(self.current_tool, success=not is_error, result=result_str)

@@ -28,6 +28,12 @@ from linear_updater import (
     linear_qa_rejected,
     linear_qa_max_iterations,
 )
+from task_logger import (
+    TaskLogger,
+    LogPhase,
+    LogEntryType,
+    get_task_logger,
+)
 
 
 # Configuration
@@ -175,6 +181,10 @@ async def run_qa_agent_session(
     print(f"  Validating all acceptance criteria...")
     print(f"{'=' * 70}\n")
 
+    # Get task logger for streaming markers
+    task_logger = get_task_logger(spec_dir)
+    current_tool = None
+
     # Load QA prompt
     prompt = load_qa_reviewer_prompt()
 
@@ -200,8 +210,30 @@ async def run_qa_agent_session(
                     if block_type == "TextBlock" and hasattr(block, "text"):
                         response_text += block.text
                         print(block.text, end="", flush=True)
+                        # Emit streaming marker
+                        if task_logger and block.text.strip():
+                            task_logger._emit("TEXT", {
+                                "content": block.text,
+                                "phase": LogPhase.VALIDATION.value,
+                                "timestamp": task_logger._timestamp()
+                            })
                     elif block_type == "ToolUseBlock" and hasattr(block, "name"):
-                        print(f"\n[QA Tool: {block.name}]", flush=True)
+                        tool_name = block.name
+                        tool_input = None
+
+                        # Extract tool input for display
+                        if hasattr(block, "input") and block.input:
+                            inp = block.input
+                            if isinstance(inp, dict):
+                                if "file_path" in inp:
+                                    fp = inp["file_path"]
+                                    if len(fp) > 50:
+                                        fp = "..." + fp[-47:]
+                                    tool_input = fp
+                                elif "pattern" in inp:
+                                    tool_input = f"pattern: {inp['pattern']}"
+
+                        print(f"\n[QA Tool: {tool_name}]", flush=True)
                         if verbose and hasattr(block, "input"):
                             input_str = str(block.input)
                             if len(input_str) > 300:
@@ -209,23 +241,34 @@ async def run_qa_agent_session(
                             else:
                                 print(f"   Input: {input_str}", flush=True)
 
+                        # Log tool start
+                        if task_logger:
+                            task_logger.tool_start(tool_name, tool_input, LogPhase.VALIDATION)
+                        current_tool = tool_name
+
             elif msg_type == "UserMessage" and hasattr(msg, "content"):
                 for block in msg.content:
                     block_type = type(block).__name__
 
                     if block_type == "ToolResultBlock":
                         is_error = getattr(block, "is_error", False)
+                        result_content = getattr(block, "content", "")
+
                         if is_error:
-                            result_content = getattr(block, "content", "")
                             error_str = str(result_content)[:500]
                             print(f"   [Error] {error_str}", flush=True)
+                            if task_logger and current_tool:
+                                task_logger.tool_end(current_tool, success=False, result=error_str[:100], phase=LogPhase.VALIDATION)
                         else:
                             if verbose:
-                                result_content = getattr(block, "content", "")
                                 result_str = str(result_content)[:200]
                                 print(f"   [Done] {result_str}", flush=True)
                             else:
                                 print("   [Done]", flush=True)
+                            if task_logger and current_tool:
+                                task_logger.tool_end(current_tool, success=True, phase=LogPhase.VALIDATION)
+
+                        current_tool = None
 
         print("\n" + "-" * 70 + "\n")
 
@@ -241,6 +284,8 @@ async def run_qa_agent_session(
 
     except Exception as e:
         print(f"Error during QA session: {e}")
+        if task_logger:
+            task_logger.log_error(f"QA session error: {e}", LogPhase.VALIDATION)
         return "error", str(e)
 
 
@@ -268,6 +313,10 @@ async def run_qa_fixer_session(
     print(f"  QA FIXER SESSION {fix_session}")
     print(f"  Applying fixes from QA_FIX_REQUEST.md...")
     print(f"{'=' * 70}\n")
+
+    # Get task logger for streaming markers
+    task_logger = get_task_logger(spec_dir)
+    current_tool = None
 
     # Check that fix request file exists
     fix_request_file = spec_dir / "QA_FIX_REQUEST.md"
@@ -298,8 +347,32 @@ async def run_qa_fixer_session(
                     if block_type == "TextBlock" and hasattr(block, "text"):
                         response_text += block.text
                         print(block.text, end="", flush=True)
+                        # Emit streaming marker
+                        if task_logger and block.text.strip():
+                            task_logger._emit("TEXT", {
+                                "content": block.text,
+                                "phase": LogPhase.VALIDATION.value,
+                                "timestamp": task_logger._timestamp()
+                            })
                     elif block_type == "ToolUseBlock" and hasattr(block, "name"):
-                        print(f"\n[Fixer Tool: {block.name}]", flush=True)
+                        tool_name = block.name
+                        tool_input = None
+
+                        if hasattr(block, "input") and block.input:
+                            inp = block.input
+                            if isinstance(inp, dict):
+                                if "file_path" in inp:
+                                    fp = inp["file_path"]
+                                    if len(fp) > 50:
+                                        fp = "..." + fp[-47:]
+                                    tool_input = fp
+                                elif "command" in inp:
+                                    cmd = inp["command"]
+                                    if len(cmd) > 50:
+                                        cmd = cmd[:47] + "..."
+                                    tool_input = cmd
+
+                        print(f"\n[Fixer Tool: {tool_name}]", flush=True)
                         if verbose and hasattr(block, "input"):
                             input_str = str(block.input)
                             if len(input_str) > 300:
@@ -307,23 +380,34 @@ async def run_qa_fixer_session(
                             else:
                                 print(f"   Input: {input_str}", flush=True)
 
+                        # Log tool start
+                        if task_logger:
+                            task_logger.tool_start(tool_name, tool_input, LogPhase.VALIDATION)
+                        current_tool = tool_name
+
             elif msg_type == "UserMessage" and hasattr(msg, "content"):
                 for block in msg.content:
                     block_type = type(block).__name__
 
                     if block_type == "ToolResultBlock":
                         is_error = getattr(block, "is_error", False)
+                        result_content = getattr(block, "content", "")
+
                         if is_error:
-                            result_content = getattr(block, "content", "")
                             error_str = str(result_content)[:500]
                             print(f"   [Error] {error_str}", flush=True)
+                            if task_logger and current_tool:
+                                task_logger.tool_end(current_tool, success=False, result=error_str[:100], phase=LogPhase.VALIDATION)
                         else:
                             if verbose:
-                                result_content = getattr(block, "content", "")
                                 result_str = str(result_content)[:200]
                                 print(f"   [Done] {result_str}", flush=True)
                             else:
                                 print("   [Done]", flush=True)
+                            if task_logger and current_tool:
+                                task_logger.tool_end(current_tool, success=True, phase=LogPhase.VALIDATION)
+
+                        current_tool = None
 
         print("\n" + "-" * 70 + "\n")
 
@@ -337,6 +421,8 @@ async def run_qa_fixer_session(
 
     except Exception as e:
         print(f"Error during fixer session: {e}")
+        if task_logger:
+            task_logger.log_error(f"QA fixer error: {e}", LogPhase.VALIDATION)
         return "error", str(e)
 
 
@@ -369,6 +455,9 @@ async def run_qa_validation_loop(
     print("  Self-validating quality assurance")
     print("=" * 70)
 
+    # Initialize task logger for the validation phase
+    task_logger = get_task_logger(spec_dir)
+
     # Verify build is complete
     if not is_build_complete(spec_dir):
         print("\n❌ Build is not complete. Cannot run QA validation.")
@@ -380,6 +469,10 @@ async def run_qa_validation_loop(
     if is_qa_approved(spec_dir):
         print("\n✅ Build already approved by QA.")
         return True
+
+    # Start validation phase in task logger
+    if task_logger:
+        task_logger.start_phase(LogPhase.VALIDATION, "Starting QA validation...")
 
     # Check Linear integration status
     linear_task = None
@@ -415,6 +508,10 @@ async def run_qa_validation_loop(
             print("\nNext steps:")
             print("  1. Review the auto-claude/* branch")
             print("  2. Create a PR and merge to main")
+
+            # End validation phase successfully
+            if task_logger:
+                task_logger.end_phase(LogPhase.VALIDATION, success=True, message="QA validation passed - all criteria met")
 
             # Update Linear: QA approved, awaiting human review
             if linear_task and linear_task.task_id:
@@ -464,6 +561,10 @@ async def run_qa_validation_loop(
     print("=" * 70)
     print(f"\nReached maximum iterations ({MAX_QA_ITERATIONS}) without approval.")
     print("\nRemaining issues require human review:")
+
+    # End validation phase as failed
+    if task_logger:
+        task_logger.end_phase(LogPhase.VALIDATION, success=False, message=f"QA validation incomplete after {qa_iteration} iterations")
 
     # Show the fix request file if it exists
     fix_request_file = spec_dir / "QA_FIX_REQUEST.md"

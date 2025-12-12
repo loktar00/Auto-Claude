@@ -154,6 +154,13 @@ export const IPC_CHANNELS = {
   TASK_STATUS_CHANGE: 'task:statusChange',
   TASK_EXECUTION_PROGRESS: 'task:executionProgress',
 
+  // Task phase logs (persistent, collapsible logs by phase)
+  TASK_LOGS_GET: 'task:logsGet',           // Load logs from spec dir
+  TASK_LOGS_WATCH: 'task:logsWatch',       // Start watching for log changes
+  TASK_LOGS_UNWATCH: 'task:logsUnwatch',   // Stop watching for log changes
+  TASK_LOGS_CHANGED: 'task:logsChanged',   // Event: logs changed (main -> renderer)
+  TASK_LOGS_STREAM: 'task:logsStream',     // Event: streaming log chunk (main -> renderer)
+
   // Terminal operations
   TERMINAL_CREATE: 'terminal:create',
   TERMINAL_DESTROY: 'terminal:destroy',

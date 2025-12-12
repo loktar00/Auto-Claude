@@ -79,6 +79,55 @@ export interface QAIssue {
   line?: number;
 }
 
+// Task Log Types - for persistent, phase-based logging
+export type TaskLogPhase = 'planning' | 'coding' | 'validation';
+export type TaskLogPhaseStatus = 'pending' | 'active' | 'completed' | 'failed';
+export type TaskLogEntryType = 'text' | 'tool_start' | 'tool_end' | 'phase_start' | 'phase_end' | 'error' | 'success' | 'info';
+
+export interface TaskLogEntry {
+  timestamp: string;
+  type: TaskLogEntryType;
+  content: string;
+  phase: TaskLogPhase;
+  tool_name?: string;
+  tool_input?: string;
+  chunk_id?: string;
+  session?: number;
+}
+
+export interface TaskPhaseLog {
+  phase: TaskLogPhase;
+  status: TaskLogPhaseStatus;
+  started_at: string | null;
+  completed_at: string | null;
+  entries: TaskLogEntry[];
+}
+
+export interface TaskLogs {
+  spec_id: string;
+  created_at: string;
+  updated_at: string;
+  phases: {
+    planning: TaskPhaseLog;
+    coding: TaskPhaseLog;
+    validation: TaskPhaseLog;
+  };
+}
+
+// Streaming markers from Python (similar to InsightsStreamChunk)
+export interface TaskLogStreamChunk {
+  type: 'text' | 'tool_start' | 'tool_end' | 'phase_start' | 'phase_end' | 'error';
+  content?: string;
+  phase?: TaskLogPhase;
+  timestamp?: string;
+  tool?: {
+    name: string;
+    input?: string;
+    success?: boolean;
+  };
+  chunk_id?: string;
+}
+
 // Image attachment types for task creation
 export interface ImageAttachment {
   id: string;           // Unique identifier (UUID)

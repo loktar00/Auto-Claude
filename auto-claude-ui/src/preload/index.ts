@@ -245,6 +245,51 @@ const electronAPI: ElectronAPI = {
   },
 
   // ============================================
+  // Task Phase Logs (collapsible by phase)
+  // ============================================
+
+  getTaskLogs: (projectId: string, specId: string): Promise<IPCResult<import('../shared/types').TaskLogs | null>> =>
+    ipcRenderer.invoke(IPC_CHANNELS.TASK_LOGS_GET, projectId, specId),
+
+  watchTaskLogs: (projectId: string, specId: string): Promise<IPCResult> =>
+    ipcRenderer.invoke(IPC_CHANNELS.TASK_LOGS_WATCH, projectId, specId),
+
+  unwatchTaskLogs: (specId: string): Promise<IPCResult> =>
+    ipcRenderer.invoke(IPC_CHANNELS.TASK_LOGS_UNWATCH, specId),
+
+  onTaskLogsChanged: (
+    callback: (specId: string, logs: import('../shared/types').TaskLogs) => void
+  ): (() => void) => {
+    const handler = (
+      _event: Electron.IpcRendererEvent,
+      specId: string,
+      logs: import('../shared/types').TaskLogs
+    ): void => {
+      callback(specId, logs);
+    };
+    ipcRenderer.on(IPC_CHANNELS.TASK_LOGS_CHANGED, handler);
+    return () => {
+      ipcRenderer.removeListener(IPC_CHANNELS.TASK_LOGS_CHANGED, handler);
+    };
+  },
+
+  onTaskLogsStream: (
+    callback: (specId: string, chunk: import('../shared/types').TaskLogStreamChunk) => void
+  ): (() => void) => {
+    const handler = (
+      _event: Electron.IpcRendererEvent,
+      specId: string,
+      chunk: import('../shared/types').TaskLogStreamChunk
+    ): void => {
+      callback(specId, chunk);
+    };
+    ipcRenderer.on(IPC_CHANNELS.TASK_LOGS_STREAM, handler);
+    return () => {
+      ipcRenderer.removeListener(IPC_CHANNELS.TASK_LOGS_STREAM, handler);
+    };
+  },
+
+  // ============================================
   // Terminal Operations
   // ============================================
 
